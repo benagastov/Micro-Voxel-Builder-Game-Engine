@@ -125,6 +125,47 @@
   }
   .hint.fade { opacity: 0; }
   .hint b { color: var(--text); }
+
+  /* Top-right keyboard-shortcuts popup (auto-hides in build mode; the build bar
+     takes this corner and carries its own hints). */
+  #keyhints {
+    position: fixed; top: 14px; right: 14px; z-index: 11;
+    width: 212px; max-width: calc(100vw - 28px);
+    background: var(--panel-bg);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border: 1px solid var(--panel-border); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--muted);
+    user-select: none; box-shadow: 0 14px 40px rgba(0,0,0,.45);
+    transition: opacity 0.4s, transform 0.4s;
+  }
+  #keyhints.hide { opacity: 0; transform: translateY(-6px); pointer-events: none; }
+  #keyhints .kh-head {
+    display: flex; align-items: center; justify-content: space-between;
+    color: var(--accent); font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; font-size: 10px; margin-bottom: 8px;
+  }
+  #keyhints .kh-x {
+    cursor: pointer; color: var(--muted); font-size: 14px; line-height: 1;
+    padding: 0 2px; border-radius: 4px;
+  }
+  #keyhints .kh-x:hover { color: var(--text); background: rgba(255,255,255,.08); }
+  #keyhints .kh-row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  #keyhints .kh-row .kh-act { color: var(--muted); }
+  #keyhints kbd {
+    display: inline-block; min-width: 16px; text-align: center;
+    background: rgba(255,255,255,.08); color: var(--text);
+    border: 1px solid var(--panel-border); border-bottom-width: 2px;
+    border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 600;
+    font-family: inherit;
+  }
+  /* Small reopen tab once the popup is dismissed */
+  #keyhints-reopen {
+    position: fixed; top: 14px; right: 14px; z-index: 11; display: none;
+    background: var(--panel-bg); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 5px 10px; font-size: 11px; color: var(--accent);
+    cursor: pointer; user-select: none;
+  }
+  #keyhints-reopen:hover { border-color: var(--accent); }
   .error {
     position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
     background: #2a1518; border: 1px solid #ff5577; color: #ffd0d8;
@@ -165,6 +206,19 @@
   </div>
   <div class="stats" id="stats">Initializing…</div>
 </div>
+
+<div id="keyhints">
+  <div class="kh-head"><span>Controls</span><span class="kh-x" id="kh-close" title="Hide">✕</span></div>
+  <div class="kh-row"><kbd>B</kbd><span class="kh-act">Build mode</span></div>
+  <div class="kh-row"><kbd>O</kbd><span class="kh-act">Save world</span></div>
+  <div class="kh-row"><kbd>I</kbd><span class="kh-act">Load world</span></div>
+  <div class="kh-row"><kbd>G</kbd><span class="kh-act">New seed</span></div>
+  <div class="kh-row"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span class="kh-act">Move</span></div>
+  <div class="kh-row"><kbd>Space</kbd><kbd>Ctrl</kbd><span class="kh-act">Up / down</span></div>
+  <div class="kh-row"><kbd>Shift</kbd><span class="kh-act">Sprint</span></div>
+  <div class="kh-row"><kbd>Esc</kbd><span class="kh-act">Cancel build</span></div>
+</div>
+<div id="keyhints-reopen" title="Show controls">⌨ Controls</div>
 
 
 <div id="buildbar">

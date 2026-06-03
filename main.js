@@ -879,6 +879,10 @@ function setupUI() {
     fadeHint();
   });
   $('regen').addEventListener('click', () => { clearEdits(); seed = (Math.random() * 1e6) | 0; resetWorld(); });
+  // Controls hints popup: dismiss with the ✕, reopen via the small tab it leaves behind.
+  const keyhints = $('keyhints'), khReopen = $('keyhints-reopen');
+  $('kh-close').addEventListener('click', () => { keyhintsDismissed = true; keyhints.classList.add('hide'); khReopen.style.display = 'block'; });
+  khReopen.addEventListener('click', () => { keyhintsDismissed = false; keyhints.classList.remove('hide'); khReopen.style.display = 'none'; });
   setupBuildUI();
 }
 
