@@ -1,565 +1,522 @@
 "use strict";
 
-/* ====================  W G S L   S H A D E R S  ==========================  */
-
-export const SH_SHARED = /* wgsl */`
-const EPS = 0.0001;
-const INV255 = 0.00392156862;
-const INV65535 = 0.0000152590219;
-const CS = 8.0;        // chunk size (voxels)
-const INVCS = 0.125;   // 1/8
-const HINVCS = 0.0625; // 1/16
-const CHUNK_U32 = 24u;
-
-struct Uniforms {
-  camPos:vec4<f32>, camFwd:vec4<f32>, camRight:vec4<f32>, camUp:vec4<f32>,
-  sunDir:vec4<f32>, sunStrength:vec4<f32>, ambient:vec4<f32>,
-  skyBot:vec4<f32>, skyTop:vec4<f32>,
-  mapSize:vec4<u32>,
-  p0:vec4<u32>,   // viewMode, frameNum, split, reqCap
-  p1:vec4<u32>,   // numDiffuse, maxDiffuse, diffuseBounce, specBounce
-  p2:vec4<f32>,   // time, shadowSoft, resX, resY
+export const SHADER_SRC = /* wgsl */`
+struct U {
+  rayMat      : mat4x4<f32>,
+  worldChunks : vec3<u32>,
+  fogDensity  : f32,
+  sunDir      : vec3<f32>,
+  time        : f32,
 };
 
-@group(0) @binding(0) var<storage, read_write> mapFlags : array<atomic<u32>>;
-@group(0) @binding(1) var<storage, read>       mapVoxIdx: array<u32>;
-@group(0) @binding(2) var<storage, read>       chunks   : array<u32>;
-@group(0) @binding(3) var<storage, read_write> voxels   : array<u32>;
-@group(0) @binding(4) var<storage, read>       materials: array<u32>;
-@group(0) @binding(5) var<uniform>             U        : Uniforms;
+@group(0) @binding(0) var outImage   : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<storage, read> pool      : array<u32>;
+@group(0) @binding(2) var<storage, read> grid      : array<u32>;
+@group(0) @binding(3) var<uniform>       uni       : U;
+@group(0) @binding(4) var<storage, read> colorPool : array<u32>;
+// G-buffer: packed surface normal (xyz, 0..1) + normalized depth (a). 1.0 = sky.
+@group(0) @binding(5) var normDepth  : texture_storage_2d<rgba8unorm, write>;
 
-struct Voxel { normal:vec3<f32>, material:u32, albedo:vec3<f32>, spec:vec3<f32>, diffuse:vec3<f32> };
-struct Mat   { emissive:u32, opacity:f32, refractIndex:f32, specular:f32, reflectType:u32, shininess:u32 };
-struct Hit   { hit:bool, rayPos:vec3<f32>, normal:vec3<f32>, voxel:Voxel, colorAdd:vec3<f32>, colorMult:f32 };
+const CH    : f32 = 32.0;
+const CHI   : u32 = 32u;
+const FULLC : u32 = 0xfffffffdu;     // states >= FULLC are sentinels, else slot
 
-fn decode4(v:u32) -> vec4<u32> {
-  return vec4<u32>((v>>24u)&255u,(v>>16u)&255u,(v>>8u)&255u,v&255u);
-}
-fn encode4(v:vec4<u32>) -> u32 {
-  let c = v & vec4<u32>(255u);
-  return (c.x<<24u)|(c.y<<16u)|(c.z<<8u)|c.w;
+fn cellIndex(c : vec3<i32>) -> u32 {
+  let wc = uni.worldChunks;
+  return (u32(c.z) * wc.y + u32(c.y)) * wc.x + u32(c.x);
 }
 
-fn getMat(i:u32) -> Mat {
-  let b = i*8u;
-  var m:Mat;
-  m.emissive     = materials[b+0u];
-  m.opacity      = bitcast<f32>(materials[b+1u]);
-  m.refractIndex = bitcast<f32>(materials[b+2u]);
-  m.specular     = bitcast<f32>(materials[b+3u]);
-  m.reflectType  = materials[b+4u];
-  m.shininess    = materials[b+5u];
-  return m;
+fn readLocal(slot : u32, l : vec3<i32>) -> bool {
+  let w = slot * 1024u + u32(l.z) * 32u + u32(l.y);
+  let bit = u32(l.x);
+  return ((pool[w] >> bit) & 1u) != 0u;
 }
 
-fn skyColor(dir:vec3<f32>) -> vec3<f32> {
-  return mix(U.skyBot.xyz, U.skyTop.xyz, dir.y*0.5+1.0);
+fn readColor(slot : u32, l : vec3<i32>) -> u32 {
+  // colorPool layout mirrors bitmask: slot * 1024 + lz*32 + ly
+  // One color per (lz,ly) word — shared by all 32 voxels along X in that word.
+  let idx = slot * 1024u + u32(l.z) * 32u + u32(l.y);
+  return colorPool[idx];  // 0 = terrain color, else top byte 0xFF + 0x00RRGGBB
 }
 
-// WGSL has no bool->numeric vector conversion; use select()
-fn fmask(m:vec3<bool>) -> vec3<f32> { return select(vec3<f32>(0.0), vec3<f32>(1.0), m); }
-fn imask(m:vec3<bool>) -> vec3<i32> { return select(vec3<i32>(0),   vec3<i32>(1),   m); }
+struct Hit { hit : bool, t : f32, n : vec3<f32>, wp : vec3<f32>, editColor : u32 };
 
-fn inMap(p:vec3<i32>) -> bool {
-  return p.x>=0 && p.y>=0 && p.z>=0 &&
-         p.x<i32(U.mapSize.x) && p.y<i32(U.mapSize.y) && p.z<i32(U.mapSize.z);
-}
-fn inChunk(p:vec3<i32>) -> bool {
-  return p.x>=0 && p.y>=0 && p.z>=0 && p.x<8 && p.y<8 && p.z<8;
-}
-fn mapIndex(p:vec3<i32>) -> u32 {
-  let x = u32(p.x);
-  let y = u32(p.y);
-  let z = u32(p.z);
-  return x + U.mapSize.x*(y + U.mapSize.y*z);
+fn skyColor(dir : vec3<f32>) -> vec3<f32> {
+  let up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+  let horizon = vec3<f32>(0.72, 0.81, 0.92);
+  let zenith  = vec3<f32>(0.26, 0.46, 0.86);
+  var c = mix(horizon, zenith, up);
+  let s = max(dot(dir, uni.sunDir), 0.0);
+  c += vec3<f32>(1.0, 0.92, 0.72) * pow(s, 64.0) * 0.9;
+  return c;
 }
 
-fn voxExists(cell:u32, cp:vec3<i32>) -> bool {
-  let idx = u32(cp.x) + 8u*(u32(cp.y)+8u*u32(cp.z));
-  return ((chunks[cell*CHUNK_U32 + 7u + (idx>>5u)] >> (idx & 31u)) & 1u) != 0u;
+fn terrainColor(wy : f32, n : vec3<f32>) -> vec3<f32> {
+  let snow  = vec3<f32>(0.94, 0.96, 1.00);
+  let rock  = vec3<f32>(0.40, 0.39, 0.37);
+  let grass = vec3<f32>(0.38, 0.56, 0.26);
+  let dirt  = vec3<f32>(0.47, 0.34, 0.22);
+  // Bands scaled to the towering peaks (plainsBase≈40, mountainTop=380): snow caps the
+  // high peaks, rock below, grass on the lower slopes/plains. Thresholds placed
+  // proportionally across the 340-voxel plains→peak span (grass/rock/snow at ~21/45/69%).
+  var c = grass;
+  if (wy > 275.0)      { c = snow; }
+  else if (wy > 193.0) { c = mix(rock, snow, clamp((wy - 193.0) / 82.0, 0.0, 1.0)); }
+  else if (wy > 111.0) { c = mix(grass, rock, clamp((wy - 111.0) / 82.0, 0.0, 1.0)); }
+  if (n.y < 0.5) { c = mix(c, dirt, select(0.35, 0.62, wy < 115.0)); }
+  return c;
 }
 
-// popcount lookup of a voxel's storage index inside the sparse chunk
-fn voxStorageIndex(cell:u32, cp:vec3<i32>) -> u32 {
-  let li  = u32(cp.x) + 8u*(u32(cp.y)+8u*u32(cp.z));
-  let bmi = li >> 5u;
-  let base = cell*CHUNK_U32;
-  var voxNum:u32 = 0u;
-  if (bmi > 3u) { voxNum = chunks[base + 4u + ((bmi>>2u)-1u)]; }
-  var i = bmi & ~3u;
-  loop {
-    if (i > bmi) { break; }
-    var bits = chunks[base + 7u + i];
-    if (i == bmi) { bits = bits & ((1u << (li & 31u)) - 1u); }
-    voxNum = voxNum + countOneBits(bits);
-    i = i + 1u;
-  }
-  return mapVoxIdx[cell] + voxNum;
-}
-
-// inverse: which (x,y,z) is the n-th stored voxel of a chunk
-fn voxPosition(cell:u32, voxNumIn:u32) -> vec3<i32> {
-  let base = cell*CHUNK_U32;
-  var count:u32 = 0u; var pos:u32 = 0u; var startI:u32 = 0u;
-  for (var i=0u; i<3u; i=i+1u) {
-    if (chunks[base+4u+i] < voxNumIn) { count = chunks[base+4u+i]; pos = pos+128u; startI = startI+4u; }
-    else { break; }
-  }
-  let voxNum = voxNumIn + 1u;
-  var i = startI;
-  loop {
-    if (i >= 16u) { break; }
-    if (count == voxNum) { break; }
-    let bc = countOneBits(chunks[base+7u+i]);
-    if (count + bc >= voxNum) {
-      var bitNum = 0u;
-      loop {
-        if (count >= voxNum) { break; }
-        count = count + ((chunks[base+7u+i] >> bitNum) & 1u);
-        bitNum = bitNum + 1u; pos = pos + 1u;
-        if (bitNum > 32u) { break; }
-      }
-    } else { count = count + bc; pos = pos + 32u; }
-    i = i + 1u;
-  }
-  if (pos > 0u) { pos = pos - 1u; }
-  if (count < voxNum) { return vec3<i32>(-1,-1,-1); }
-  return vec3<i32>(i32(pos%8u), i32((pos/8u)%8u), i32(pos/64u));
-}
-
-fn decompress(vIndex:u32) -> Voxel {
-  let b = vIndex*4u;
-  let nR = decode4(voxels[b+0u]);
-  let aR = decode4(voxels[b+1u]);
-  let sR = decode4(voxels[b+2u]);
-  let dR = decode4(voxels[b+3u]);
-  let dUp = vec3<u32>(sR.z, dR.x, dR.z) << vec3<u32>(8u);
-  let dLo = vec3<u32>(sR.w, dR.y, dR.w);
-  let dif = vec3<f32>(dUp | dLo);
-  var v:Voxel;
-  v.normal   = (vec3<f32>(nR.yzw)*INV255 - 0.5)*2.0;
-  v.material = nR.x;
-  v.albedo   = vec3<f32>(aR.xyz)*INV255;
-  v.diffuse  = dif*INV65535;
-  v.spec     = vec3<f32>(f32(aR.w), f32(sR.x), f32(sR.y))*INV255;
-  return v;
-}
-
-// ---- two-level DDA: chunk grid (skip empties) then voxels inside hit chunk --
-fn stepMap(rayDirIn:vec3<f32>, rayPosIn:vec3<f32>, ignoreFirstIn:bool,
-           maxDepth:f32, normalIn:vec3<f32>, orgPos:vec3<f32>, propagateVis:bool) -> Hit {
-  var H:Hit;
-  H.hit = false; H.colorAdd = vec3<f32>(0.0); H.colorMult = 1.0; H.normal = normalIn;
-  H.rayPos = rayPosIn;
-  let rayDir = rayDirIn;
-  let invDir = 1.0 / rayDir;
-  var rayPos = rayPosIn;
-  var ignoreFirst = ignoreFirstIn;
-
-  // outer DDA setup
-  var pos = vec3<i32>(floor(rayPos));
-  let dDist = abs(invDir);
-  let rStep = vec3<i32>(sign(rayDir));
-  var sDist = (sign(rayDir)*(vec3<f32>(pos)-rayPos) + sign(rayDir)*0.5 + 0.5) * dDist;
-  var lastS = vec3<f32>(0.0);
-
-  var guard = 0;
-  loop {
-    if (!inMap(pos) || guard > 4096) { break; }
-    guard = guard + 1;
-    let cell = mapIndex(pos);
-    let flags = atomicLoad(&mapFlags[cell]);
-    if ((flags & 3u) == 2u) {
-      let m = min(min(lastS.x,lastS.y),lastS.z);
-      let upd = rayPos + rayDir*(m - EPS);
-      var cRay = (upd - vec3<f32>(pos))*CS;
-      cRay = clamp(cRay, vec3<f32>(EPS), vec3<f32>(CS-EPS));
-
-      // ---- inner voxel DDA ----
-      var ip = vec3<i32>(floor(cRay));
-      let idDist = dDist;            // same direction
-      var isDist = (sign(rayDir)*(vec3<f32>(ip)-cRay) + sign(rayDir)*0.5 + 0.5) * idDist;
-      var ilast  = vec3<f32>(0.0);
-      var lastVoxID:u32 = 0xffffffffu;
-      var iguard = 0;
-      loop {
-        if (!inChunk(ip) || iguard > 64) { break; }
-        iguard = iguard + 1;
-        if (voxExists(cell, ip) && !ignoreFirst) {
-          let vIndex = voxStorageIndex(cell, ip);
-          let vx = decompress(vIndex);
-          let mat = getMat(vx.material);
-          if (mat.opacity >= 1.0) {
-            let mm = min(min(ilast.x,ilast.y),ilast.z);
-            cRay = cRay + rayDir*(mm + EPS);
-            H.hit = true; H.voxel = vx;
-            H.rayPos = vec3<f32>(pos) + cRay*INVCS;
-            if (propagateVis) { atomicOr(&mapFlags[cell], 4u); }
-            return H;
-          } else {
-            let rawA = voxels[vIndex*4u+1u];
-            let rawN = voxels[vIndex*4u+0u];
-            let thisID = (rawA & 0xffffff00u) | (rawN >> 24u);
-            if (lastVoxID != thisID) {
-              let mm = min(min(ilast.x,ilast.y),ilast.z);
-              var cur = cRay + rayDir*mm;
-              cur = vec3<f32>(pos) + cur*INVCS;
-              let toCur = cur - orgPos;
-              if (maxDepth < 0.0 || dot(toCur,toCur) < maxDepth*maxDepth) {
-                H.colorAdd = H.colorAdd + H.colorMult*mat.opacity*vx.albedo*U.sunStrength.xyz;
-                H.colorMult = H.colorMult*(1.0 - mat.opacity);
-              }
-              lastVoxID = thisID;
-            }
-          }
-        }
-        // iterate inner
-        let mask = isDist.xyz <= min(isDist.yzx, isDist.zxy);
-        ilast = isDist;
-        isDist = isDist + fmask(mask)*idDist;
-        ip = ip + imask(mask)*rStep;
-        H.normal = fmask(mask)*(-vec3<f32>(rStep));
-        ignoreFirst = false;
-      }
+fn innerDDA(o : vec3<f32>, dir : vec3<f32>, inv : vec3<f32>, stepi : vec3<i32>,
+            cell : vec3<i32>, slot : u32, tEntry : f32, entryAxis : i32) -> Hit {
+  var miss : Hit; miss.hit = false; miss.editColor = 0u; miss.wp = vec3<f32>(0.0);
+  let base = vec3<f32>(cell) * CH;
+  let pe = o + dir * (tEntry + 1e-3) - base;
+  var l = vec3<i32>(clamp(floor(pe), vec3<f32>(0.0), vec3<f32>(31.0)));
+  let vb = base + vec3<f32>(l) + select(vec3<f32>(0.0), vec3<f32>(1.0), dir > vec3<f32>(0.0));
+  var tMax = (vb - o) * inv;
+  let tDelta = abs(inv);
+  var axis = entryAxis;
+  var t = tEntry;
+  // If the ray started inside this chunk (entryAxis == -1), skip the first voxel
+  // so we don't render the terrain block the camera is embedded in.
+  var skipFirst = (entryAxis < 0);
+  for (var k : u32 = 0u; k < 128u; k = k + 1u) {
+    if (l.x < 0 || l.y < 0 || l.z < 0 || l.x > 31 || l.y > 31 || l.z > 31) { return miss; }
+    if (skipFirst) { skipFirst = false; }
+    else if (readLocal(slot, l)) {
+      var h : Hit; h.hit = true; h.t = t;
+      var n = vec3<f32>(0.0);
+      if (axis == 0) { n.x = -f32(stepi.x); }
+      else if (axis == 1) { n.y = -f32(stepi.y); }
+      else { n.z = -f32(stepi.z); }
+      h.n = n;
+      h.wp = base + vec3<f32>(l);
+      h.editColor = readColor(slot, l);
+      return h;
     }
-    // iterate outer
-    let mask = sDist.xyz <= min(sDist.yzx, sDist.zxy);
-    lastS = sDist;
-    sDist = sDist + fmask(mask)*dDist;
-    pos = pos + imask(mask)*rStep;
-    H.normal = fmask(mask)*(-vec3<f32>(rStep));
-    ignoreFirst = false;
+    if (tMax.x < tMax.y) {
+      if (tMax.x < tMax.z) { l.x += stepi.x; t = tMax.x; tMax.x += tDelta.x; axis = 0; }
+      else                 { l.z += stepi.z; t = tMax.z; tMax.z += tDelta.z; axis = 2; }
+    } else {
+      if (tMax.y < tMax.z) { l.y += stepi.y; t = tMax.y; tMax.y += tDelta.y; axis = 1; }
+      else                 { l.z += stepi.z; t = tMax.z; tMax.z += tDelta.z; axis = 2; }
+    }
   }
-  return H;
+  return miss;
+}
+
+fn trace(o : vec3<f32>, dIn : vec3<f32>) -> Hit {
+  var miss : Hit; miss.hit = false; miss.editColor = 0u; miss.wp = vec3<f32>(0.0);
+  let dir = select(dIn, vec3<f32>(1e-6), dIn == vec3<f32>(0.0));
+  let inv = 1.0 / dir;
+  let wc = uni.worldChunks;
+  let WV = vec3<f32>(f32(wc.x) * CH, f32(wc.y) * CH, f32(wc.z) * CH);
+
+  let t0 = (vec3<f32>(0.0) - o) * inv;
+  let t1 = (WV - o) * inv;
+  let tlo = min(t0, t1);
+  let thi = max(t0, t1);
+  var tenter = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+  let texit  = min(min(thi.x, thi.y), thi.z);
+  if (tenter > texit) { return miss; }
+
+  let stepi = vec3<i32>(sign(dir));
+  var lastAxis : i32 = -1;
+  if (tenter > 0.0) {
+    if (tlo.x >= tlo.y && tlo.x >= tlo.z) { lastAxis = 0; }
+    else if (tlo.y >= tlo.z) { lastAxis = 1; }
+    else { lastAxis = 2; }
+  } else {
+    tenter = 0.0;
+  }
+  var t = tenter;
+  let p = o + dir * (t + 1e-3);
+  var cell = clamp(vec3<i32>(floor(p / CH)),
+                   vec3<i32>(0),
+                   vec3<i32>(i32(wc.x) - 1, i32(wc.y) - 1, i32(wc.z) - 1));
+
+  let nb = (vec3<f32>(cell) + select(vec3<f32>(0.0), vec3<f32>(1.0), dir > vec3<f32>(0.0))) * CH;
+  var tMax = (nb - o) * inv;
+  let tDelta = abs(CH * inv);
+
+  for (var it : u32 = 0u; it < 800u; it = it + 1u) {
+    if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+        cell.x >= i32(wc.x) || cell.y >= i32(wc.y) || cell.z >= i32(wc.z)) { break; }
+
+    let state = grid[cellIndex(cell)];
+    if (state >= FULLC) {
+      if (state == FULLC) {                 // full solid chunk: hit at entry face
+        // lastAxis == -1 means we started inside this chunk (camera inside solid).
+        // Skip it so we don't render a false "big sphere" around the camera.
+        if (lastAxis < 0) {
+          // fall through to step to the next chunk
+        } else {
+          var h : Hit; h.hit = true; h.t = t; h.editColor = 0u;
+          var n = vec3<f32>(0.0);
+          if (lastAxis == 0) { n.x = -f32(stepi.x); }
+          else if (lastAxis == 1) { n.y = -f32(stepi.y); }
+          else { n.z = -f32(stepi.z); }
+          h.n = n;
+          h.wp = o + dir * t;
+          return h;
+        }
+      }
+      // EMPTY, UNKNOWN, or skipped FULL: fall through and step to the next chunk.
+    } else {
+      let inn = innerDDA(o, dir, inv, stepi, cell, state, t, lastAxis);
+      if (inn.hit) { return inn; }
+    }
+
+    if (tMax.x < tMax.y) {
+      if (tMax.x < tMax.z) { cell.x += stepi.x; t = tMax.x; tMax.x += tDelta.x; lastAxis = 0; }
+      else                 { cell.z += stepi.z; t = tMax.z; tMax.z += tDelta.z; lastAxis = 2; }
+    } else {
+      if (tMax.y < tMax.z) { cell.y += stepi.y; t = tMax.y; tMax.y += tDelta.y; lastAxis = 1; }
+      else                 { cell.z += stepi.z; t = tMax.z; tMax.z += tDelta.z; lastAxis = 2; }
+    }
+  }
+  return miss;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let dims = textureDimensions(outImage);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let pixel = vec2<i32>(gid.xy);
+
+  let o = uni.rayMat[3].xyz;
+  let d = (uni.rayMat * vec4<f32>(vec2<f32>(pixel) + vec2<f32>(0.5), 1.0, 0.0)).xyz;
+  let dn = normalize(d);
+
+  let h = trace(o, d);
+  var col : vec3<f32>;
+  let isEditColor = h.hit && ((h.editColor >> 24u) == 0xFFu);
+  // A ray only stops at a solid voxel it reached *through air* (the DDA arrives
+  // from an empty cell), so any hit is, by construction, a face adjacent to air —
+  // exactly the "neighbor is air" face-culling rule the mesh renderer in src/ uses.
+  // We therefore draw every hit. Looking down from above, the ray stops at the top
+  // surface and never sees the dirt below it; flying underground, the dug-out/cave
+  // walls around you are exactly the air-adjacent faces, so they stay visible.
+  let isSurface   = h.hit;
+
+  var gn = vec3<f32>(0.0);   // surface normal for the G-buffer (0 = sky)
+  var gd = 1.0;              // normalized depth for the G-buffer (1 = sky/far)
+  if (isSurface) {
+    var base : vec3<f32>;
+    if (isEditColor) {
+      let r = f32((h.editColor >> 16u) & 255u) / 255.0;
+      let g = f32((h.editColor >>  8u) & 255u) / 255.0;
+      let b = f32( h.editColor         & 255u) / 255.0;
+      base = vec3<f32>(r, g, b);
+    } else {
+      base = terrainColor(h.wp.y, h.n);
+    }
+    let lambert = max(dot(h.n, uni.sunDir), 0.0) * 0.75 + 0.28;
+    col = base * lambert;
+    let fog = clamp(1.0 - exp(-h.t * uni.fogDensity), 0.0, 1.0);
+    col = mix(col, skyColor(dn), fog);
+    gn = h.n;
+    // Normalize hit distance against world width so edge thresholds are scale-stable.
+    let WX = f32(uni.worldChunks.x) * CH;
+    gd = clamp(h.t / (WX * 1.5), 0.0, 0.999);
+  } else {
+    // No hit, or hit is underground/buried — show sky (void/emptiness)
+    col = skyColor(dn);
+  }
+  // mild tonemap / gamma
+  col = pow(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.85));
+  textureStore(outImage, pixel, vec4<f32>(col, 1.0));
+  textureStore(normDepth, pixel, vec4<f32>(gn * 0.5 + 0.5, gd));
 }
 `;
 
-export const SH_DRAW = /* wgsl */`
-const GAMMA = 2.2;
-const INV_GAMMA = 0.4545;
-@group(0) @binding(6) var outTex : texture_storage_2d<rgba8unorm, write>;
+export const BLIT_SRC = /* wgsl */`
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+struct VSOut { @builtin(position) pos : vec4<f32> };
+@vertex fn vs(@builtin(vertex_index) vi : u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  var o : VSOut; o.pos = vec4<f32>(p[vi], 0.0, 1.0); return o;
+}
+@fragment fn fs(@builtin(position) fp : vec4<f32>) -> @location(0) vec4<f32> {
+  return textureLoad(srcTex, vec2<i32>(i32(fp.x), i32(fp.y)), 0);
+}
+`;
 
-// ---- procedural sky (only for primary background rays) -------------------
-fn hash21(p:vec2<f32>) -> f32 {
-  let h = dot(p, vec2<f32>(127.1, 311.7));
-  return fract(sin(h)*43758.5453);
+// Screen-space edge outline pass, ported from old_sparse/SH_EDGE. Darkens depth
+// discontinuities (silhouettes/steps) and lightens normal creases, which makes
+// each voxel step read crisply instead of merging into smooth slabs.
+export const EDGE_SRC = /* wgsl */`
+@group(0) @binding(0) var colorTex     : texture_2d<f32>;
+@group(0) @binding(1) var normDepthTex : texture_2d<f32>;
+@group(0) @binding(2) var outTex       : texture_storage_2d<rgba8unorm, write>;
+
+fn getDepth(pos:vec2<i32>, sz:vec2<i32>) -> f32 {
+  return textureLoad(normDepthTex, clamp(pos, vec2<i32>(0), sz-1), 0).a;
 }
-fn vn2(p:vec2<f32>) -> f32 {
-  let i = floor(p); let f = fract(p);
-  let u = f*f*(3.0-2.0*f);
-  let a = hash21(i);
-  let b = hash21(i+vec2<f32>(1.0,0.0));
-  let c = hash21(i+vec2<f32>(0.0,1.0));
-  let d = hash21(i+vec2<f32>(1.0,1.0));
-  return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);
-}
-fn fbm2(p:vec2<f32>) -> f32 {
-  var s=0.0; var amp=0.5; var q=p;
-  for (var i=0; i<5; i=i+1) { s = s + amp*vn2(q); q = q*2.0; amp = amp*0.5; }
-  return s;
-}
-fn skySky(dirIn:vec3<f32>) -> vec3<f32> {
-  let dir = normalize(dirIn);
-  let up  = clamp(dir.y, -1.0, 1.0);
-  // vertical gradient: pale warm horizon → deep blue zenith
-  let zenith  = vec3<f32>(0.18, 0.36, 0.66);
-  let horizon = vec3<f32>(0.80, 0.87, 0.94);
-  var col = mix(horizon, zenith, pow(clamp(up,0.0,1.0), 0.55));
-  // soft haze just below the horizon line
-  let ground = vec3<f32>(0.55, 0.58, 0.58);
-  col = mix(col, ground, smoothstep(0.0, -0.16, up));
-  // sun disc + warm halo
-  let sd   = max(dot(dir, normalize(U.sunDir.xyz)), 0.0);
-  let glow = pow(sd, 6.0)*0.35 + pow(sd, 110.0)*0.55;
-  let disc = pow(sd, 2200.0);
-  col = col + vec3<f32>(1.00, 0.82, 0.55)*glow;
-  col = col + vec3<f32>(1.00, 0.96, 0.88)*disc*3.0;
-  // drifting cumulus, projected on a sky dome, faded near horizon
-  if (up > 0.015) {
-    let pl = dir.xz / (dir.y + 0.16);
-    let t  = U.p2.x * 0.004;
-    var c  = fbm2(pl*1.3 + vec2<f32>(t, t*0.6));
-    c = smoothstep(0.50, 0.92, c);
-    let edge = smoothstep(0.015, 0.20, up);
-    let lit  = clamp(dot(normalize(vec3<f32>(pl.x,1.0,pl.y)), normalize(U.sunDir.xyz)), 0.0, 1.0);
-    let cloudCol = mix(vec3<f32>(0.80,0.83,0.88), vec3<f32>(1.0,0.99,0.96), lit);
-    col = mix(col, cloudCol, c*edge*0.85);
-  }
-  return col;
+fn getNormal(pos:vec2<i32>, sz:vec2<i32>) -> vec3<f32> {
+  return textureLoad(normDepthTex, clamp(pos, vec2<i32>(0), sz-1), 0).rgb * 2.0 - 1.0;
 }
 
-fn intersectAABB(invDir:vec3<f32>, ro:vec3<f32>, bmin:vec3<f32>, bmax:vec3<f32>) -> vec2<f32> {
-  let t1 = (bmin-ro)*invDir; let t2 = (bmax-ro)*invDir;
-  let a = min(t1,t2); let b = max(t1,t2);
-  return vec2<f32>(max(max(a.x,a.y),a.z), min(min(b.x,b.y),b.z));
+fn depthEdgeIndicator(pos:vec2<i32>, sz:vec2<i32>) -> f32 {
+  let d = getDepth(pos, sz);
+  var diff = 0.0;
+  diff += clamp(getDepth(pos+vec2<i32>( 1, 0), sz) - d, 0.0, 1.0);
+  diff += clamp(getDepth(pos+vec2<i32>(-1, 0), sz) - d, 0.0, 1.0);
+  diff += clamp(getDepth(pos+vec2<i32>( 0, 1), sz) - d, 0.0, 1.0);
+  diff += clamp(getDepth(pos+vec2<i32>( 0,-1), sz) - d, 0.0, 1.0);
+  return floor(smoothstep(0.002, 0.008, diff) * 2.0) / 2.0;
 }
-fn normalAABB(p:vec3<f32>, bmin:vec3<f32>, bmax:vec3<f32>) -> vec3<f32> {
-  let c=(bmin+bmax)*0.5; let d=(bmax-bmin)*0.5;
-  return normalize(trunc((p-c)/d*(1.0+EPS)));
+
+fn neighborNormalEdge(pos:vec2<i32>, off:vec2<i32>, sz:vec2<i32>, depth:f32, normal:vec3<f32>) -> f32 {
+  let npos = pos + off;
+  let depthDiff = getDepth(npos, sz) - depth;
+  let nNormal = getNormal(npos, sz);
+  let normalDiff = dot(normal - nNormal, vec3<f32>(1.0));
+  let normalIndicator = clamp(smoothstep(-0.01, 0.01, normalDiff), 0.0, 1.0);
+  let depthIndicator  = clamp(sign(depthDiff * 0.25 + 0.0025), 0.0, 1.0);
+  return distance(normal, nNormal) * depthIndicator * normalIndicator;
 }
-fn voxelColor(v:Voxel, colorAdd:vec3<f32>, colorMult:f32, hitN:vec3<f32>) -> vec3<f32> {
-  let m = getMat(v.material);
-  var spec = v.spec * m.specular;
-  var dif  = v.diffuse * (1.0 - m.specular);
-  let vm = U.p0.x;
-  if (vm == 0u) {
-    var solid:vec3<f32>;
-    if (m.emissive != 0u) { solid = v.albedo; }
-    else { solid = dif*v.albedo + spec; }
-    return solid*colorMult + colorAdd;
-  } else if (vm == 1u) { return v.albedo; }
-  else if (vm == 2u)  { if (m.emissive!=0u){return v.albedo;} return dif; }
-  else if (vm == 3u)  { if (m.emissive!=0u){return v.albedo;} return spec; }
-  else if (vm == 4u)  { return abs(v.normal); }
-  else                { return abs(hitN); }
+
+fn normalEdgeIndicator(pos:vec2<i32>, sz:vec2<i32>) -> f32 {
+  let d = getDepth(pos, sz);
+  let n = getNormal(pos, sz);
+  var ind = 0.0;
+  ind += neighborNormalEdge(pos, vec2<i32>( 0,-1), sz, d, n);
+  ind += neighborNormalEdge(pos, vec2<i32>( 0, 1), sz, d, n);
+  ind += neighborNormalEdge(pos, vec2<i32>(-1, 0), sz, d, n);
+  ind += neighborNormalEdge(pos, vec2<i32>( 1, 0), sz, d, n);
+  return step(0.1, ind);
 }
 
 @compute @workgroup_size(8,8,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
-  let res = vec2<u32>(u32(U.p2.z), u32(U.p2.w));
-  if (gid.x >= res.x || gid.y >= res.y) { return; }
-  let coords = vec2<i32>(i32(gid.x), i32(gid.y));
+  let sz  = vec2<i32>(textureDimensions(colorTex));
+  let pos = vec2<i32>(gid.xy);
+  if (pos.x >= sz.x || pos.y >= sz.y) { return; }
 
-  // ray from camera basis
-  let ndc = vec2<f32>(
-     (f32(gid.x)+0.5)/f32(res.x)*2.0 - 1.0,
-     1.0 - (f32(gid.y)+0.5)/f32(res.y)*2.0 );
-  let ro = U.camPos.xyz;
-  let rd = normalize(U.camFwd.xyz + ndc.x*U.camRight.xyz + ndc.y*U.camUp.xyz) + vec3<f32>(EPS);
-  let invRd = 1.0/rd;
+  let dei = depthEdgeIndicator(pos, sz);
+  let nei = normalEdgeIndicator(pos, sz);
 
-  var color:vec3<f32>;
-  let ms = vec3<f32>(f32(U.mapSize.x),f32(U.mapSize.y),f32(U.mapSize.z));
-  let it = intersectAABB(invRd, ro, vec3<f32>(0.0), ms);
+  let coefficient = select(1.0 + 0.3 * nei, 1.0 - 0.7 * dei, dei > 0.0);
+  let src = textureLoad(colorTex, pos, 0);
+  textureStore(outTex, pos, vec4<f32>(clamp(src.rgb * coefficient, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
+}
+`;
 
-  if (it.x > it.y || it.y < 0.0) {
-    color = pow(skySky(rd), vec3<f32>(GAMMA));
+export const WORKER_SRC = `
+const CH = 32;
+function ih(x, z, seed) {
+  let h = Math.imul(x|0,374761393) ^ Math.imul(z|0,668265263) ^ Math.imul(seed>>>0,2246822519);
+  h = Math.imul(h ^ (h >>> 15), 2246822519); h ^= h >>> 13; h = Math.imul(h, 3266489917); h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function smooth(t) { return t * t * (3 - 2 * t); }
+function vnoise(x, z, seed) {
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const a = ih(xi, zi, seed), b = ih(xi + 1, zi, seed), c = ih(xi, zi + 1, seed), d = ih(xi + 1, zi + 1, seed);
+  const u = smooth(xf), v = smooth(zf);
+  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+}
+function fbm(x, z, seed, oct = 5) { let s = 0, amp = 1, f = 1, norm = 0; for (let o = 0; o < oct; o++) { s += amp * vnoise(x * f, z * f, seed + o * 1311); norm += amp; amp *= 0.5; f *= 2; } return s / norm; }
+function ridged(x, z, seed, oct = 5) { let s = 0, amp = 1, f = 1, norm = 0; for (let o = 0; o < oct; o++) { let n = vnoise(x * f, z * f, seed + o * 1777); n = 1 - Math.abs(2 * n - 1); n *= n; s += amp * n; norm += amp; amp *= 0.5; f *= 2; } return s / norm; }
+function height(wx, wz, seed) {
+  // Terrain scales off the 128-voxel world height (WY*CH = 4*32), matching old_sparse
+  // (VY=128): plainsBase≈40, mountainTop≈107 — fits under the 128 ceiling.
+  const VY = 128;
+  const plainsBase = Math.round(VY * 0.31);       // old_sparse: flat buildable plains (~40)
+  const mountainTop = 380;                          // towering Minecraft-scale peaks (~340 above plains);
+                                                    // just under the 416 (WY*CH=13*32) ceiling
+  const tcx = 8192 * 0.5, tcz = 8192 * 0.5, clearR = 120;
+  const raw = fbm(wx * 0.0022 + 3.7, wz * 0.0022 + 1.9, seed, 3);
+  const keepFade = Math.min(1, Math.max(0, (Math.hypot(wx - tcx, wz - tcz) - clearR) / 96));
+  const b = raw * keepFade;
+  const blend = Math.min(1, Math.max(0, (b - 0.62) / 0.10));
+  const blendS = blend * blend * (3 - 2 * blend);
+  if (blendS < 0.001) return plainsBase;
+  // Cliffy plateau (mesa/table-mountain) shaping. FBM (rounded blobs) instead of
+  // ridged (sharp needles) gives broad massifs; a low exponent keeps mid-elevations
+  // wide rather than pinching them into peaks. The continuous height is then TERRACED
+  // (quantized to discrete levels) so smooth slopes become flat shelves separated by
+  // vertical cliff faces — large flat tops with cliffy step-ups between them.
+  const m1 = fbm(wx * 0.006 + 1.3, wz * 0.006 + 2.7, seed, 5);
+  const m2 = fbm(wx * 0.015 + 5.1, wz * 0.015 + 3.9, seed, 4);
+  const shape = m1 * 0.72 + m2 * 0.28;
+  const elev = Math.pow(Math.max(0, shape - 0.12) / 0.88, 0.85);  // broad plateaus
+  let mtnH = plainsBase + (mountainTop - plainsBase) * elev;
+  // Terrace into flat shelves. STEP = shelf height ≈ cliff height between levels.
+  const STEP = 26;
+  const lvl = Math.floor(mtnH / STEP);
+  const frac = mtnH / STEP - lvl;                       // 0..1 within the current shelf
+  // Sharpen the transition: snap most of each shelf flat, then a quick cliff face near
+  // the top of the band. pow(frac, 6) stays ~0 across the flat top and shoots up only
+  // in the last sliver, so risers read as near-vertical cliffs, treads as flat tops.
+  const cliff = Math.pow(frac, 6);
+  mtnH = (lvl + cliff) * STEP;
+  // A little sub-voxel grit so cliff edges and tops aren't machine-perfect.
+  mtnH += fbm(wx * 0.06 + 7.1, wz * 0.06 + 4.3, seed, 3) * 3 - 1.5;
+  return plainsBase * (1 - blendS) + mtnH * blendS;
+}
+self.onmessage = (e) => {
+  const m = e.data;
+  const { cell, cx, cy, cz, seed, edits, apronEdits } = m;
+  const t0 = performance.now();
+  const wx0 = cx * CH, wy0 = cy * CH, wz0 = cz * CH;
+  // editMap: localIndex → [solid, r, g, b]  (edits inside this chunk)
+  const editMap = edits && edits.length
+    ? new Map(edits.map(e => [e[0], {s:e[1], r:e[2]??0, g:e[3]??0, b:e[4]??0}]))
+    : null;
+  // apronMap: "wx,wy,wz" → solid  (edits one voxel outside this chunk, so the
+  // air-touching test sees holes dug just across a chunk border).
+  const apronMap = apronEdits && apronEdits.length
+    ? new Map(apronEdits.map(e => [e[0] + ',' + e[1] + ',' + e[2], e[3]]))
+    : null;
+  // Any edit (interior or apron) means terrain exposure may have changed, so the
+  // full 6-neighbor air-touching test must run for this chunk.
+  const hasEdits = !!editMap || !!apronMap;
+  // Sample the heightmap one voxel wider on each side (a 34x34 padded grid) so we
+  // know the terrain top of every horizontal neighbor, including those that fall in
+  // the adjacent chunk. With neighbor tops we can tell whether a solid voxel is
+  // exposed to air (a surface/cliff voxel) or fully buried (all 6 neighbors solid).
+  const PAD = CH + 2;
+  const hmP = new Float32Array(PAD * PAD);
+  let minH = 1e9, maxH = -1e9;     // over interior columns (for the all-air test)
+  let minHpad = 1e9;               // over interior + 1-voxel apron (for the buried test)
+  for (let pz = 0; pz < PAD; pz++) {
+    for (let px = 0; px < PAD; px++) {
+      const h = height(wx0 + px - 1, wz0 + pz - 1, seed);
+      hmP[pz * PAD + px] = h;
+      if (h < minHpad) minHpad = h;
+      // Track interior min/max over the actual 32x32 chunk columns only.
+      if (px >= 1 && px <= CH && pz >= 1 && pz <= CH) {
+        if (h < minH) minH = h;
+        if (h > maxH) maxH = h;
+      }
+    }
+  }
+  const hmCol = (lx, lz) => hmP[(lz + 1) * PAD + (lx + 1)];  // interior accessor, lx/lz in 0..31
+  // top(x,z) and the min of the 4 horizontal neighbor tops, per column.
+  const colTop = new Int32Array(CH * CH);
+  const colNbrMin = new Int32Array(CH * CH);  // min floor() of N/E/S/W neighbor tops
+  for (let lz = 0; lz < CH; lz++) {
+    for (let lx = 0; lx < CH; lx++) {
+      const t  = Math.floor(hmCol(lx, lz));
+      const tn = Math.min(
+        Math.floor(hmCol(lx - 1, lz)), Math.floor(hmCol(lx + 1, lz)),
+        Math.floor(hmCol(lx, lz - 1)), Math.floor(hmCol(lx, lz + 1)),
+      );
+      colTop[lz * CH + lx] = t;
+      colNbrMin[lz * CH + lx] = tn;
+    }
+  }
+  const topVox = wy0 + CH - 1;
+  let kind, count = 0, buf = null, cbuf = null;
+  if (!hasEdits && wy0 > maxH) {
+    // Entire chunk is above all terrain → empty (unchanged).
+    kind = 0;
+  } else if (!hasEdits && topVox < minHpad) {
+    // Even this chunk's highest voxel sits below the lowest terrain surface of any
+    // adjacent column. Every voxel is buried on all sides. Keep it FULL (solid) — NOT
+    // empty: a FULL chunk stops the ray instantly at its entry face (one DDA step),
+    // exactly like old_sparse relies on solid chunks to block rays. The face is
+    // underground so it's never reached from above (the surface shell blocks first),
+    // and marking it empty instead would force rays to march across the whole hollow
+    // interior — the cause of the framerate collapse. FULL stores zero voxel data.
+    kind = 1; count = CH * CH * CH;
   } else {
-    var rp = ro;
-    if (it.x > 0.0) { rp = rp + rd*(it.x+EPS); }
-    var n = normalAABB(rp, vec3<f32>(0.0), ms);
-    let H = stepMap(rd, rp, false, -1.0, n, ro, true);
-    if (H.hit) {
-      color = voxelColor(H.voxel, H.colorAdd, H.colorMult, H.normal);
-    } else {
-      color = pow(skySky(rd), vec3<f32>(GAMMA))*H.colorMult + H.colorAdd;
-    }
-  }
-  color = pow(color, vec3<f32>(INV_GAMMA));
-  textureStore(outTex, coords, vec4<f32>(color, 1.0));
-}
-`;
-
-export const SH_LIGHT = /* wgsl */`
-@group(0) @binding(6) var<storage, read>        requests   : array<u32>;
-@group(0) @binding(7) var<storage, read_write>  sampleCount: array<atomic<u32>>;
-
-var<private> SP : array<vec3<f32>,15> = array<vec3<f32>,15>(
-  vec3<f32>(0.0,1.0,0.0), vec3<f32>(-0.379803,0.857143,0.347931), vec3<f32>(0.061185,0.714286,-0.697174),
-  vec3<f32>(0.499316,0.571429,0.651270), vec3<f32>(-0.889696,0.428571,-0.157375), vec3<f32>(0.808584,0.285714,-0.514354),
-  vec3<f32>(-0.256942,0.142857,0.955810), vec3<f32>(-0.460906,0.0,-0.887449), vec3<f32>(0.929687,-0.142857,0.339521),
-  vec3<f32>(-0.885815,-0.285714,0.365650), vec3<f32>(0.382949,-0.428571,-0.818338), vec3<f32>(0.245607,-0.571429,0.783037),
-  vec3<f32>(-0.605521,-0.714286,-0.350913), vec3<f32>(0.503065,-0.857143,-0.110596), vec3<f32>(0.0,-1.0,0.0));
-
-fn rnd(s:f32) -> f32 { return fract(sin(s)*43758.5453)*2.0 - 1.0; }
-fn rnd3(s:f32) -> vec3<f32> { return vec3<f32>(rnd(s),rnd(s*2.0),rnd(s*3.0)); }
-fn rndSphere(seed:f32) -> vec3<f32> {
-  var s = seed;
-  for (var k=0; k<12; k=k+1) { let p = rnd3(s); s = s + 1.0; if (dot(p,p) < 1.0) { return p; } }
-  return normalize(rnd3(s));
-}
-
-var<private> firstSample:bool;
-
-fn shadowRay(rayPos:vec3<f32>, seed:f32, color:ptr<function,vec3<f32>>) {
-  var sdir:vec3<f32>;
-  if (firstSample) { sdir = U.sunDir.xyz + vec3<f32>(EPS); }
-  else { sdir = normalize(U.sunDir.xyz*U.p2.y + rndSphere(seed)) + vec3<f32>(EPS); }
-  let H = stepMap(sdir, rayPos, true, -1.0, vec3<f32>(0.0), rayPos, false);
-  if (!H.hit) { *color = *color + U.sunStrength.xyz*H.colorMult + H.colorAdd; }
-}
-
-fn specularRay(mapPos:vec3<i32>, rayPosIn:vec3<f32>, rayDirIn:vec3<f32>,
-               albedo:vec3<f32>, color:ptr<function,vec3<f32>>) {
-  var rayPos = rayPosIn; var rayDir = rayDirIn;
-  var lastPos = rayPos; var mult = albedo;
-  let limit = i32(U.p1.w);
-  for (var i=0; i<limit; i=i+1) {
-    let H = stepMap(rayDir, rayPos, true, -1.0, vec3<f32>(0.0), rayPos, true);
-    rayPos = H.rayPos;
-    if (H.hit) {
-      let d = abs(floor(rayPos*CS) - floor(lastPos*CS));
-      if (dot(d,d) <= 1.0) { return; }
-      let hm = getMat(H.voxel.material);
-      let hdif = H.voxel.diffuse*(1.0 - hm.specular);
-      if (hm.emissive != 0u) {
-        *color = *color + (H.voxel.albedo*H.colorMult + H.colorAdd)*mult*albedo; return;
-      } else {
-        let hc = hdif*H.voxel.albedo;
-        *color = *color + (hc*H.colorMult + H.colorAdd)*mult;
-        if (hm.specular == 0.0) { return; }
-        mult = mult*H.voxel.albedo*H.colorMult*hm.specular;
-        lastPos = rayPos;
-        rayDir = reflect(rayDir, H.voxel.normal);
+    kind = 2;
+    const words  = new Uint32Array(CH * CH);  // bitmask: 1024 u32s
+    const colors = new Uint32Array(CH * CH);  // word-level color: 1024 u32s, one per (lz,ly)
+    let hasColor = false;
+    // True world-space solidity, accounting for edits. Used for the 6-neighbor
+    // air-touching test so digging a hole re-exposes the surrounding buried voxels.
+    //   x,z are world coords; the heightmap is sampled directly (works for any cell,
+    //   even outside this chunk). Edits only exist inside this chunk's local range.
+    const solidWorld = (x, y, z) => {
+      if (y < 0) return false;
+      if (editMap) {
+        const elx = x - wx0, ely = y - wy0, elz = z - wz0;
+        if (elx >= 0 && elx < CH && ely >= 0 && ely < CH && elz >= 0 && elz < CH) {
+          const e = editMap.get(elx + CH * (ely + CH * elz));
+          if (e) return e.s === 1;
+        }
       }
-    } else if (dot(rayDir, U.sunDir.xyz) > 0.99) {
-      *color = *color + (U.sunStrength.xyz*H.colorMult + H.colorAdd); return;
-    } else {
-      *color = *color + (skyColor(rayDir)*H.colorMult + H.colorAdd)*mult; return;
-    }
-  }
-}
-
-fn diffuseRay(normal:vec3<f32>, rayPosIn:vec3<f32>, initial:Voxel, seed:f32, color:ptr<function,vec3<f32>>) {
-  var hitVox = initial; var hitN = normal; var hm:Mat = getMat(initial.material);
-  var newColor = vec3<f32>(1.0);
-  var rayPos = rayPosIn; var lastPos = rayPos; var lastDir = vec3<f32>(0.0);
-  let limit = i32(U.p1.z);
-  for (var i=0; i<limit; i=i+1) {
-    var dir:vec3<f32>;
-    if (i>0 && (rnd(seed + f32(limit) + f32(i))+1.0)*0.5 < hm.specular) {
-      dir = normalize(reflect(lastDir, hitN)*f32(hm.shininess) + rndSphere(U.p2.x + f32(i)));
-    } else if (firstSample) {
-      dir = normalize(hitN) + vec3<f32>(EPS);
-    } else {
-      dir = normalize(hitN + rndSphere(seed + f32(i))) + vec3<f32>(EPS);
-    }
-    let H = stepMap(dir, rayPos, true, -1.0, vec3<f32>(0.0), rayPos, false);
-    let nrp = H.rayPos;
-    hitVox = H.voxel; hitN = hitVox.normal; hm = getMat(hitVox.material);
-    if (H.hit) {
-      rayPos = nrp;
-      let d = abs(floor(lastPos*CS) - floor(rayPos*CS));
-      if (dot(d,d) < 1.0) { return; }
-      if (hm.emissive != 0u) {
-        *color = *color + newColor*(hitVox.albedo*H.colorMult + H.colorAdd); return;
-      } else {
-        newColor = newColor*(hitVox.albedo*H.colorMult + H.colorAdd);
+      if (apronMap) {
+        const a = apronMap.get(x + ',' + y + ',' + z);
+        if (a !== undefined) return a === 1;
       }
-    } else {
-      *color = *color + (newColor*max(dot(dir,U.sunDir.xyz),0.0)*U.sunStrength.xyz*H.colorMult + H.colorAdd);
-      return;
+      // Reuse the precomputed padded heightmap when the column is in range
+      // (it covers wx0-1..wx0+CH, wz0-1..wz0+CH — exactly the 6-neighbor reach),
+      // avoiding a fresh 5-octave FBM eval per neighbor. Fall back to height() only
+      // for the rare out-of-apron column.
+      const px = x - wx0 + 1, pz = z - wz0 + 1;
+      const h = (px >= 0 && px < PAD && pz >= 0 && pz < PAD)
+        ? hmP[pz * PAD + px]
+        : height(x, z, seed);
+      return y <= Math.floor(h);
+    };
+    for (let lz = 0; lz < CH; lz++) {
+      for (let lx = 0; lx < CH; lx++) {
+        const top    = colTop[lz * CH + lx];
+        const nbrMin = colNbrMin[lz * CH + lx];
+        for (let ly = 0; ly < CH; ly++) {
+          const li = lx + CH * (ly + CH * lz);
+          const wy = wy0 + ly, wx = wx0 + lx, wz = wz0 + lz;
+          // We render like src/: keep a voxel solid only if it touches air on some side.
+          // Three cases below — explicit edit, edited-chunk (authoritative 6-neighbor
+          // test), or unedited chunk (fast heightmap-only test).
+          const isTerrain  = wy <= top;
+          let solid = false;
+          let cr = 0, cg = 0, cb = 0, hasEditColor = false;
+          const ed = editMap ? editMap.get(li) : undefined;
+          if (ed) {
+            // Explicit edit wins outright.
+            solid = ed.s === 1;
+            if (solid && (ed.r || ed.g || ed.b)) {
+              cr = ed.r; cg = ed.g; cb = ed.b; hasEditColor = true;
+            }
+          } else if (hasEdits) {
+            // This chunk (or a neighbor) was edited, so the cheap heightmap-only
+            // air-touching test can be wrong in either direction — a dug pit exposes a
+            // previously-buried voxel, or a raised mound buries a previously-surface one.
+            // Decide authoritatively: a terrain voxel is solid iff it's terrain AND at
+            // least one of its 6 neighbors is air (per true, edit-aware solidity).
+            if (isTerrain) {
+              solid =
+                !solidWorld(wx - 1, wy, wz) || !solidWorld(wx + 1, wy, wz) ||
+                !solidWorld(wx, wy - 1, wz) || !solidWorld(wx, wy + 1, wz) ||
+                !solidWorld(wx, wy, wz - 1) || !solidWorld(wx, wy, wz + 1);
+            }
+          } else {
+            // Unedited chunk: fast heightmap-only air-touching test.
+            //   • topmost voxel of the column (air directly above), or
+            //   • a horizontal neighbor column's terrain is lower (exposed cliff side).
+            solid = isTerrain && (wy === top || wy > nbrMin);
+          }
+          if (solid) {
+            words[lz * CH + ly] |= (1 << lx);
+            count++;
+            if (hasEditColor) {
+              // Store in word-level slot: (lz, ly) — all X voxels in this word share the color
+              colors[lz * CH + ly] = (0xFF << 24) | (cr << 16) | (cg << 8) | cb;
+              hasColor = true;
+            }
+          }
+        }
+      }
     }
-    lastDir = dir;
-  }
-}
-
-@compute @workgroup_size(32,1,1)
-fn main(@builtin(workgroup_id) wid:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let req = requests[wid.x];
-  let cell = req >> 4u;
-  let group = req & 15u;
-  let cb = cell*CHUNK_U32;
-  let mapPos = vec3<i32>(bitcast<i32>(chunks[cb+0u]), bitcast<i32>(chunks[cb+1u]), bitcast<i32>(chunks[cb+2u]));
-  let voxNum = lid.x + group*32u;
-  let cp = voxPosition(cell, voxNum);
-  if (!inChunk(cp)) { return; }
-
-  let vIndex = mapVoxIdx[cell] + voxNum;
-  let vx = decompress(vIndex);
-  let mat = getMat(vx.material);
-  let stored = atomicLoad(&sampleCount[cell]);
-  let indirectSamples = f32(min(stored, U.p1.y));
-  firstSample = (indirectSamples == 0.0);
-
-  var rayPos = INVCS*vec3<f32>(cp) + vec3<f32>(mapPos) + vec3<f32>(HINVCS);
-  rayPos = rayPos + (HINVCS - EPS)*vx.normal;
-
-  var specLight = vec3<f32>(0.0);
-  var diffuseLight = vec3<f32>(0.0);
-
-  let viewDir = rayPos - U.camPos.xyz;
-  if (mat.specular > 0.0 && dot(viewDir, vx.normal) < 0.0 && mat.reflectType <= 1u) {
-    let refl = reflect(normalize(viewDir), vx.normal);
-    for (var i=0; i<15; i=i+1) {
-      let sd = normalize(refl*f32(mat.shininess) + SP[i]) + vec3<f32>(EPS);
-      specularRay(mapPos, rayPos, sd, vx.albedo, &specLight);
+    if (count === 0) kind = 0;
+    else if (count === CH * CH * CH) kind = 1;
+    else {
+      buf = words.buffer;
+      if (hasColor) cbuf = colors.buffer;
     }
-    specLight = specLight/15.0;
   }
-
-  if (mat.specular < 1.0) {
-    let nd = i32(U.p1.x);
-    for (var i=0; i<nd; i=i+1) {
-      diffuseLight = diffuseLight + U.ambient.xyz;
-      diffuseRay(vx.normal+vec3<f32>(EPS), rayPos, vx, U.p2.x*f32(i+1), &diffuseLight);
-      shadowRay(rayPos, U.p2.x*f32(i+1+nd), &diffuseLight);
-    }
-    diffuseLight = (vx.diffuse*indirectSamples + diffuseLight)/(indirectSamples + f32(nd));
-  }
-
-  specLight = clamp(specLight, vec3<f32>(0.0), vec3<f32>(1.0));
-  diffuseLight = clamp(diffuseLight, vec3<f32>(0.0), vec3<f32>(1.0));
-
-  let wd = vec3<u32>(round(diffuseLight*65535.0));
-  let wLo = wd & vec3<u32>(255u);
-  let wUp = (wd >> vec3<u32>(8u)) & vec3<u32>(255u);
-
-  let b = vIndex*4u;
-  voxels[b+1u] = encode4(vec4<u32>(vec3<u32>(round(vx.albedo*255.0)), u32(round(specLight.x*255.0))));
-  voxels[b+2u] = encode4(vec4<u32>(vec2<u32>(round(specLight.yz*255.0)), wUp.x, wLo.x));
-  voxels[b+3u] = encode4(vec4<u32>(wUp.y, wLo.y, wUp.z, wLo.z));
-
-  if (lid.x == 0u && group == 0u) { atomicAdd(&sampleCount[cell], 1u); }
-}
+  const genMs = performance.now() - t0;
+  const msg = { cell, cx, cy, cz, kind, count, genMs };
+  const transfers = [];
+  if (buf)  { msg.buf  = buf;  transfers.push(buf); }
+  if (cbuf) { msg.cbuf = cbuf; transfers.push(cbuf); }
+  self.postMessage(msg, transfers);
+};
 `;
-
-export const SH_BUILD = /* wgsl */`
-struct U2 { mapSize:vec4<u32>, p0:vec4<u32> };
-@group(0) @binding(0) var<storage, read_write> mapFlags : array<atomic<u32>>;
-@group(0) @binding(1) var<storage, read>       chunks   : array<u32>;
-@group(0) @binding(2) var<storage, read_write> requests : array<u32>;
-@group(0) @binding(3) var<storage, read_write> counter  : atomic<u32>;
-@group(0) @binding(4) var<uniform>             U        : U2;
-
-@compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
-  let cell = gid.x;
-  let total = U.mapSize.x*U.mapSize.y*U.mapSize.z;
-  if (cell >= total) { return; }
-  let flags = atomicLoad(&mapFlags[cell]);
-  let loaded = (flags & 3u) == 2u;
-  let visible = (flags & 4u) != 0u;
-  // consume the visible bit every frame
-  atomicAnd(&mapFlags[cell], ~4u);
-  if (!loaded || !visible) { return; }
-  let split = U.p0.z; let frame = U.p0.y;
-  if (cell % split != frame) { return; }
-  let numVox = chunks[cell*24u + 3u];
-  let cap = U.p0.w;
-  var g = 0u;
-  loop {
-    if (g*32u >= numVox) { break; }
-    let idx = atomicAdd(&counter, 1u);
-    if (idx < cap) { requests[idx] = (cell << 4u) | g; }
-    g = g + 1u;
-  }
-}
-`;
-
-export const SH_ARGS = /* wgsl */`
-@group(0) @binding(0) var<storage, read>       counter : u32;
-@group(0) @binding(1) var<storage, read_write> args    : array<u32>;
-@group(0) @binding(2) var<uniform>             cap     : u32;
-@compute @workgroup_size(1,1,1)
-fn main() {
-  args[0] = min(counter, cap);
-  args[1] = 1u;
-  args[2] = 1u;
-}
-`;
-
-export const SH_BLIT = /* wgsl */`
-@group(0) @binding(0) var tex : texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-struct VO { @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
-@vertex fn vs(@builtin(vertex_index) i:u32) -> VO {
-  var p = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
-  var o:VO; let xy = p[i]; o.pos = vec4<f32>(xy,0.0,1.0);
-  o.uv = vec2<f32>((xy.x+1.0)*0.5, 1.0-(xy.y+1.0)*0.5); return o;
-}
-@fragment fn fs(in:VO) -> @location(0) vec4<f32> {
-  return textureSampleLevel(tex, samp, in.uv, 0.0);
-}
-`;
-

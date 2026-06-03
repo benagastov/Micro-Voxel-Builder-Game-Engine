@@ -2,257 +2,231 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>DoonEngine — WebGPU per-voxel path tracer</title>
+<title>Voxel World — WebGPU streaming</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root{
-    --bg:#0a0c10; --panel:rgba(14,18,24,.82); --line:#1d2a36;
-    --acc:#54e6c8; --acc2:#ffb454; --txt:#c7d3dd; --dim:#6a7d8c;
+  :root {
+    --panel-bg: rgba(16, 18, 26, 0.82);
+    --panel-border: rgba(255, 255, 255, 0.08);
+    --text: #e8eaf0;
+    --muted: #9aa0ac;
+    --accent: #8ab4ff;
+    --good: #74e08a;
   }
-  *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;
-    font-family:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--txt)}
-  #gpu{position:fixed;inset:0;width:100%;height:100%;display:block;image-rendering:pixelated;cursor:crosshair}
-  /* HUD */
-  .hud{position:fixed;pointer-events:none;z-index:10}
-  #top{top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:flex-start;padding:14px 16px;
-    background:linear-gradient(180deg,rgba(6,8,11,.75),rgba(6,8,11,0))}
-  .brand{font-weight:700;letter-spacing:.18em;font-size:13px;color:#eaf2f7;text-transform:uppercase}
-  .brand b{color:var(--acc)}
-  .brand .sub{display:block;font-weight:400;letter-spacing:.05em;font-size:10px;color:var(--dim);margin-top:3px}
-  #stats{text-align:right;font-size:11px;line-height:1.7;color:var(--dim)}
-  #stats .v{color:var(--acc);font-weight:600}
-  #stats .w{color:var(--acc2)}
-  #panel{left:16px;bottom:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:13px 15px;backdrop-filter:blur(9px);font-size:11px;line-height:1.65;max-width:330px;
-    box-shadow:0 14px 40px rgba(0,0,0,.5)}
-  #panel h2{margin:0 0 7px;font-size:10px;letter-spacing:.16em;color:var(--acc);text-transform:uppercase}
-  #panel .row{display:flex;justify-content:space-between;gap:14px;color:var(--dim)}
-  #panel .row span:last-child{color:var(--txt)}
-  kbd{font:inherit;background:#16212c;border:1px solid #243441;border-bottom-width:2px;border-radius:4px;
-    padding:0 5px;color:#dbe6ee;font-size:10px}
-  #modebar{right:16px;bottom:146px;display:flex;flex-direction:column;gap:5px;align-items:flex-end}
-  .mode{font-size:10px;letter-spacing:.05em;color:var(--dim)}
-  .mode b{color:var(--acc2)}
-  #radar{right:16px;bottom:16px;width:116px;background:var(--panel);border:1px solid var(--line);
-    border-radius:14px;padding:9px 9px 8px;backdrop-filter:blur(9px);box-shadow:0 14px 40px rgba(0,0,0,.5)}
-  #radar svg{display:block;width:98px;height:98px;overflow:visible}
-  #radar .ring{fill:rgba(8,12,18,.7);stroke:#243441;stroke-width:1.4}
-  #radar .cross{stroke:#1d2a36;stroke-width:1}
-  #radar .needle{fill:var(--acc);filter:drop-shadow(0 0 5px rgba(84,230,200,.45))}
-  #radar .spawn{fill:var(--acc2);stroke:#141820;stroke-width:1.2;filter:drop-shadow(0 0 5px rgba(255,180,84,.55))}
-  #radar .you{fill:#eaf2f7;stroke:#141820;stroke-width:1.2}
-  #radar .north{fill:var(--dim);font-size:9px;font-weight:700;text-anchor:middle}
-  #radar .label{margin-top:5px;text-align:center;font-size:10px;line-height:1.35;color:var(--dim)}
-  #radar .label b{color:var(--acc2)}
-  #radar .hint{display:block;color:var(--dim);font-size:9px}
-  #overlay{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
-    background:radial-gradient(120% 120% at 50% 30%,rgba(20,30,40,.6),rgba(5,7,10,.96));backdrop-filter:blur(3px)}
-  #overlay .card{max-width:560px;text-align:center;padding:34px 40px}
-  #overlay h1{font-size:24px;letter-spacing:.06em;margin:0 0 6px;color:#eef5f9}
-  #overlay h1 b{color:var(--acc)}
-  #overlay p{color:var(--dim);font-size:13px;line-height:1.7;margin:10px 0}
-  #overlay .keys{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;text-align:left;
-    margin:18px auto;width:max-content;font-size:12px;color:var(--txt)}
-  #overlay .keys div:nth-child(odd){color:var(--dim)}
-  #start{pointer-events:auto;cursor:pointer;margin-top:14px;display:inline-block;
-    background:var(--acc);color:#04211b;border:none;font:inherit;font-weight:700;letter-spacing:.1em;
-    padding:12px 30px;border-radius:8px;text-transform:uppercase;font-size:12px;transition:transform .12s,box-shadow .12s}
-  #start:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(84,230,200,.3)}
-  #err{color:#ff6b6b;font-size:12px;margin-top:14px;white-space:pre-wrap;text-align:left}
-  .seedrow{display:flex;gap:8px;align-items:center;justify-content:center;margin:16px auto 4px;pointer-events:auto}
-  .seedrow label{font-size:11px;letter-spacing:.16em;color:var(--dim)}
-  .seedrow input{flex:0 1 220px;background:#0d141b;border:1px solid var(--line);border-radius:7px;
-    color:#eaf2f7;font:inherit;font-size:13px;padding:9px 12px;outline:none}
-  .seedrow input:focus{border-color:var(--acc)}
-  .seedrow button{background:#16212c;border:1px solid var(--line);border-radius:7px;cursor:pointer;
-    font-size:15px;padding:7px 11px;line-height:1}
-  .seedrow button:hover{border-color:var(--acc)}
-  #loading{position:fixed;inset:0;z-index:30;display:none;align-items:center;justify-content:center;
-    background:rgba(5,7,10,.92);flex-direction:column;gap:14px}
-  #loading .bar{width:280px;height:4px;background:#16212c;border-radius:3px;overflow:hidden}
-  #loading .bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
-  #loading .t{font-size:12px;color:var(--dim);letter-spacing:.1em}
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #0c0e14; color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  canvas {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    display: block; image-rendering: pixelated; cursor: crosshair;
+  }
+  .panel {
+    position: fixed; top: 14px; left: 14px;
+    background: var(--panel-bg);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border: 1px solid var(--panel-border); border-radius: 8px;
+    padding: 12px 14px; width: 296px; max-width: calc(100vw - 28px);
+    font-size: 13px; z-index: 10; user-select: none;
+  }
+  .panel h1 { font-size: 14px; font-weight: 600; margin: 0 0 4px 0; }
+  .panel .sub { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+  .panel .row { margin: 9px 0; display: flex; align-items: center; gap: 8px; }
+  .panel label { color: var(--muted); font-size: 12px; flex-shrink: 0; min-width: 84px; }
+  .panel input[type=range] {
+    background: rgba(0,0,0,0.3); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 2px 4px; flex: 1;
+  }
+  .panel .val { font-size: 12px; color: var(--muted); min-width: 40px; text-align: right; }
+  .panel button {
+    background: rgba(138, 180, 255, 0.15); color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 4px;
+    padding: 6px 10px; cursor: pointer; font-size: 12px; flex: 1;
+    transition: background 0.15s;
+  }
+  .panel button:hover { background: rgba(138, 180, 255, 0.25); }
+  .panel button.toggle.on { background: rgba(116,224,138,0.2); border-color: var(--good); color: var(--good); }
 
-  /* ---- focus / pointer-lock UI ---- */
-  #gpu.unlocked{cursor:crosshair}
-  #gpu.locked  {cursor:none}
+  /* Build toolbar copied to the fast streamer UI */
+  #buildbar {
+    position: fixed; top: 14px; right: 14px; z-index: 12; display: none;
+    width: 252px; max-width: calc(100vw - 28px);
+    background: var(--panel-bg); border: 1px solid var(--panel-border);
+    border-radius: 10px; padding: 12px 12px 14px; backdrop-filter: blur(8px);
+    box-shadow: 0 14px 40px rgba(0,0,0,.45); font-size: 11px; user-select: none;
+  }
+  #buildbar .bb-title { color: var(--accent); font-weight: 700; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 8px; }
+  #buildbar .bb-tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  #buildbar .bb-tab {
+    flex: 1; padding: 5px 4px; text-align: center; cursor: pointer; font-size: 10px;
+    font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    border: 1px solid var(--panel-border); border-radius: 5px;
+    background: rgba(255,255,255,.04); color: var(--muted); transition: all .12s;
+  }
+  #buildbar .bb-tab:hover { border-color: var(--accent); color: var(--accent); }
+  #buildbar .bb-tab.active { background: rgba(138,180,255,.18); border-color: var(--accent); color: var(--accent); }
+  #buildbar .tf-tool {
+    background: rgba(255,255,255,.05); border: 1px solid var(--panel-border); border-radius: 7px;
+    padding: 7px 4px; text-align: center; cursor: pointer; transition: all .12s;
+  }
+  #buildbar .tf-tool:hover { border-color: var(--accent); }
+  #buildbar .tf-tool.active { background: var(--accent); border-color: var(--accent); color: #07121f; }
+  #buildbar .tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  #buildbar .tool {
+    background: rgba(255,255,255,.05); border: 1px solid var(--panel-border); border-radius: 7px;
+    padding: 7px 4px; text-align: center; cursor: pointer; transition: all .12s;
+  }
+  #buildbar .tool:hover { border-color: var(--accent); }
+  #buildbar .tool.active { background: var(--accent); border-color: var(--accent); color: #07121f; }
+  #buildbar .tool.danger.active { background: #ff6b6b; border-color: #ff6b6b; color: #2a0d0d; }
+  #buildbar .ti { display:block; font-size: 17px; line-height: 1.1; }
+  #buildbar .tl { display:block; font-weight: 700; font-size: 10px; }
+  #buildbar .swatches { display:grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-top: 6px; }
+  #buildbar .swatch { height: 22px; border-radius: 5px; border: 2px solid rgba(255,255,255,.16); cursor: pointer; }
+  #buildbar .swatch.active { border-color: #fff; box-shadow: 0 0 0 1px var(--accent); }
+  #buildbar .bb-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  #buildbar .bb-row label { min-width: 58px; color: var(--muted); }
+  #buildbar .bb-row input { flex:1; accent-color: var(--accent); min-width:0; }
+  #buildbar .bb-row span { width: 24px; text-align:right; color: var(--text); font-weight:600; }
+  #buildbar .bb-hint { margin-top:10px; line-height:1.45; color: var(--muted); background:rgba(0,0,0,.22); border:1px solid var(--panel-border); border-radius:7px; padding:8px; }
+  #buildbar .bb-hint b { color: var(--good); }
+  #bd-badge {
+    position:fixed; left:50%; top:54px; transform:translateX(-50%); z-index:13; display:none;
+    background:var(--panel-bg); border:1px solid var(--accent); border-radius:18px; padding:6px 16px;
+    font-size:11px; color:var(--text); letter-spacing:.06em; pointer-events:none;
+  }
 
-  /* pulsing "click to look" pill — visible when game is running but not locked */
-  #focus-banner{
-    left:50%;bottom:48px;transform:translateX(-50%);
-    background:rgba(8,12,18,.88);border:1px solid var(--acc);
-    border-radius:20px;padding:8px 22px;display:none;
-    font-size:11px;letter-spacing:.15em;color:var(--acc);
-    text-transform:uppercase;white-space:nowrap;
-    box-shadow:0 0 20px rgba(84,230,200,.12);
-    animation:fpulse 2.6s ease-in-out infinite;
-    transition:border-color .2s,color .2s;
+  .stats {
+    font-size: 11.5px; color: var(--muted); margin-top: 10px; line-height: 1.75;
+    border-top: 1px solid var(--panel-border); padding-top: 8px;
+    font-variant-numeric: tabular-nums;
   }
-  #focus-banner.err{border-color:#ff6b6b;color:#ff9999;animation:none}
-  @keyframes fpulse{
-    0%,100%{opacity:.5;box-shadow:0 0 10px rgba(84,230,200,.08)}
-       50% {opacity:1;box-shadow:0 0 26px rgba(84,230,200,.26)}
+  .stats b { color: var(--text); font-weight: 600; }
+  .stats .big { color: var(--good); font-weight: 600; }
+  .crosshair {
+    position: fixed; top: 50%; left: 50%; width: 14px; height: 14px;
+    transform: translate(-50%, -50%); pointer-events: none; z-index: 8; opacity: 0.6;
   }
-  /* crosshair — centre of screen, only while locked */
-  #xhair{
-    top:50%;left:50%;transform:translate(-50%,-50%);
-    display:none;width:24px;height:24px;
-    filter:drop-shadow(0 0 3px rgba(0,0,0,.95));
+  .crosshair::before, .crosshair::after {
+    content: ""; position: absolute; background: rgba(255,255,255,0.8);
   }
-  /* tiny ESC nudge in top-right modebar when locked */
-  #esc-hint{display:none;font-size:10px;color:var(--dim);letter-spacing:.07em}
-  #esc-hint b{color:rgba(84,230,200,.6)}
-
-  /* ---- BUILD toolbar ---- */
-  #gpu.build{cursor:crosshair}
-  #buildbar{position:fixed;top:64px;right:16px;z-index:15;display:none;width:236px;
-    background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    padding:14px 14px 16px;backdrop-filter:blur(9px);box-shadow:0 16px 44px rgba(0,0,0,.5)}
-  .bb-title{font-size:10px;letter-spacing:.16em;color:var(--acc);text-transform:uppercase;margin:0 0 9px}
-  .bb-title.mt{margin-top:14px}
-  .tool-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
-  .tool{display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;
-    background:#11202b;border:1px solid var(--line);border-radius:9px;padding:9px 4px 7px;
-    transition:all .12s;user-select:none}
-  .tool:hover{border-color:#2f4a5c;background:#162937}
-  .tool.active{background:var(--acc);border-color:var(--acc);color:#04211b}
-  .tool.active .ti{color:#04211b}
-  .tool.danger.active{background:#ff6b6b;border-color:#ff6b6b;color:#2a0d0d}
-  .ti{font-size:18px;line-height:1}
-  .tl{font-size:10px;font-weight:700;letter-spacing:.02em}
-  .swatches{display:grid;grid-template-columns:repeat(6,1fr);gap:6px}
-  .swatch{aspect-ratio:1;border-radius:7px;cursor:pointer;border:2px solid rgba(255,255,255,.12);
-    box-shadow:inset 0 0 0 1px rgba(0,0,0,.3)}
-  .swatch:hover{border-color:rgba(255,255,255,.4)}
-  .swatch.active{border-color:var(--acc);box-shadow:0 0 0 2px rgba(84,230,200,.4)}
-  .bb-row{display:flex;align-items:center;gap:9px;margin-top:11px;font-size:11px;color:var(--dim)}
-  .bb-row label{flex:0 0 64px;letter-spacing:.04em}
-  .bb-row input[type=range]{flex:1;accent-color:var(--acc);min-width:0}
-  .bb-row span{flex:0 0 22px;text-align:right;color:var(--txt);font-weight:600}
-  .bb-hint{margin-top:13px;font-size:10.5px;line-height:1.55;color:var(--dim);
-    background:#0d141b;border:1px solid var(--line);border-radius:8px;padding:9px 10px}
-  .bb-hint b{color:var(--acc2)}
-  #bd-badge{position:fixed;left:50%;top:54px;transform:translateX(-50%);z-index:15;display:none;
-    background:rgba(8,12,18,.9);border:1px solid var(--acc);border-radius:18px;padding:6px 18px;
-    font-size:11px;letter-spacing:.1em;color:var(--acc);text-transform:uppercase}
-  #bd-badge b{color:var(--acc2)} #bd-badge span{color:#eaf2f7}
+  .crosshair::before { left: 6px; top: 0; width: 2px; height: 14px; }
+  .crosshair::after { top: 6px; left: 0; height: 2px; width: 14px; }
+  .hint {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-bg); backdrop-filter: blur(8px);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 8px 14px; font-size: 12px; color: var(--muted); z-index: 10;
+    transition: opacity 0.5s; pointer-events: none; text-align: center;
+  }
+  .hint.fade { opacity: 0; }
+  .hint b { color: var(--text); }
+  .error {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: #2a1518; border: 1px solid #ff5577; color: #ffd0d8;
+    padding: 20px 24px; border-radius: 8px; max-width: 600px; z-index: 100;
+    font-size: 14px; line-height: 1.5;
+  }
+  .error h2 { margin: 0 0 8px 0; color: #ff8aa0; }
+  .error a { color: var(--accent); }
+  .error pre { background: rgba(0,0,0,0.5); padding: 8px; border-radius: 4px;
+    max-height: 240px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<canvas id="gpu"></canvas>
+<canvas id="c"></canvas>
+<div class="crosshair" id="cross" style="display:none"></div>
 
-<div id="top" class="hud">
-  <div class="brand"><b>DOON</b>ENGINE · <span style="color:var(--acc2)">WEBGPU</span>
-    <span class="sub">per-voxel path tracer — sparse microvoxel world</span></div>
-  <div id="stats">
-    <div><span class="v" id="fps">–</span> fps · <span id="ms">–</span> ms</div>
-    <div>world <span class="v" id="dim">–</span> vox</div>
-    <div>stored <span class="v" id="vox">–</span> · chunks <span class="v" id="chk">–</span></div>
-    <div>lit/frame <span class="w" id="lit">–</span> grp</div>
-    <div>vram <span class="v" id="vram">–</span></div>
-    <div>stream <span class="v" id="streamstat">idle</span></div>
+<div class="panel" id="panel">
+  <h1>Voxel World</h1>
+  <div class="sub" id="worldsub">— voxel world · WebGPU ray traversal</div>
+  <div class="row">
+    <label for="dist">Render dist</label>
+    <input id="dist" type="range" min="6" max="28" step="1" value="14" />
+    <span class="val" id="distVal">14</span>
   </div>
+  <div class="row">
+    <label for="scale">Resolution</label>
+    <input id="scale" type="range" min="35" max="100" step="5" value="65" />
+    <span class="val" id="scaleVal">65%</span>
+  </div>
+  <div class="row">
+    <label for="speed">Fly speed</label>
+    <input id="speed" type="range" min="20" max="600" step="10" value="120" />
+    <span class="val" id="speedVal">120</span>
+  </div>
+  <div class="row">
+    <button id="autofly" class="toggle">Auto-fly</button>
+    <button id="regen">New world</button>
+  </div>
+  <div class="stats" id="stats">Initializing…</div>
 </div>
 
-<div id="panel" class="hud">
-  <h2>Controls</h2>
-  <div class="row"><span>Move / Fly</span><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Spc</kbd><kbd>Ctrl</kbd></span></div>
-  <div class="row"><span>Look</span><span><kbd>click</kbd> lock · <kbd>Esc</kbd> release</span></div>
-  <div class="row"><span>Sprint</span><span><kbd>Shift</kbd></span></div>
-  <div class="row"><span>View mode</span><span><kbd>1</kbd>…<kbd>6</kbd></span></div>
-  <div class="row"><span>Toggle sun spin</span><span><kbd>L</kbd></span></div>
-  <div class="row"><span>Reset lighting</span><span><kbd>R</kbd></span></div>
-  <div class="row"><span>New world</span><span><kbd>G</kbd> random seed</span></div>
-  <div class="row"><span>Radar spawn</span><span><kbd>Ctrl</kbd>+<kbd>U</kbd> set here</span></div>
-  <div class="row"><span>Save / Load</span><span><kbd>O</kbd> save · <kbd>I</kbd> load</span></div>
-  <div class="row"><span>Seed</span><span id="seedval" style="color:var(--acc2)">–</span></div>
-</div>
 
-<div id="radar" class="hud" aria-label="Spawn radar">
-  <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-    <circle class="ring" cx="50" cy="50" r="45"/>
-    <line class="cross" x1="50" y1="8" x2="50" y2="92"/>
-    <line class="cross" x1="8" y1="50" x2="92" y2="50"/>
-    <text class="north" x="50" y="18">N</text>
-    <polygon id="radar-needle" class="needle" points="50,42 56,58 50,55 44,58"/>
-    <circle id="radar-spawn" class="spawn" cx="50" cy="50" r="4"/>
-    <circle class="you" cx="50" cy="50" r="3"/>
-  </svg>
-  <div class="label">SPAWN <b id="radar-dist">0m</b><span class="hint">Ctrl+U set</span></div>
-</div>
-
-<div id="modebar" class="hud">
-  <div class="mode">VIEW · <b id="modename">FULL LIGHTING</b></div>
-  <div class="mode">SUN · <b id="sunstate">FIXED</b></div>
-  <div id="esc-hint"><b>ESC</b> · exit look</div>
-</div>
-
-<!-- BUILD toolbar (Sims/SketchUp-style) -->
 <div id="buildbar">
-  <div class="bb-title">Build · Tools</div>
-  <div class="tool-grid">
-    <div class="tool" data-tool="block"><span class="ti">▦</span><span class="tl">Block</span></div>
-    <div class="tool" data-tool="wall"><span class="ti">▭</span><span class="tl">Wall</span></div>
-    <div class="tool" data-tool="arc"><span class="ti">◠</span><span class="tl">Arc</span></div>
-    <div class="tool" data-tool="circle"><span class="ti">◯</span><span class="tl">Circle</span></div>
-    <div class="tool" data-tool="square"><span class="ti">□</span><span class="tl">Square</span></div>
-    <div class="tool" data-tool="disc"><span class="ti">⬤</span><span class="tl">Pedestal</span></div>
-    <div class="tool" data-tool="rect"><span class="ti">▤</span><span class="tl">Foundation</span></div>
-    <div class="tool danger" data-tool="remove"><span class="ti">⌫</span><span class="tl">Remove</span></div>
+  <div class="bb-title">Build Mode</div>
+  <div class="bb-tabs">
+    <div class="bb-tab active" id="tab-native" data-submode="native">Native</div>
+    <div class="bb-tab" id="tab-planner" data-submode="planner">Planner</div>
+    <div class="bb-tab" id="tab-terraform" data-submode="terraform">Terraform</div>
   </div>
-  <div class="bb-title mt">Material</div>
+
+  <!-- Native tools -->
+  <div id="native-tools">
+    <div class="tool-grid">
+      <div class="tool" data-tool="block"><span class="ti">▦</span><span class="tl">Block</span></div>
+      <div class="tool" data-tool="wall"><span class="ti">▭</span><span class="tl">Wall</span></div>
+      <div class="tool" data-tool="arc"><span class="ti">◠</span><span class="tl">Arc</span></div>
+      <div class="tool" data-tool="circle"><span class="ti">◯</span><span class="tl">Circle</span></div>
+      <div class="tool" data-tool="square"><span class="ti">▢</span><span class="tl">Square</span></div>
+      <div class="tool" data-tool="disc"><span class="ti">⬤</span><span class="tl">Pedestal</span></div>
+      <div class="tool" data-tool="rect"><span class="ti">▤</span><span class="tl">Foundation</span></div>
+      <div class="tool danger" data-tool="remove"><span class="ti">⌫</span><span class="tl">Remove</span></div>
+    </div>
+    <div class="bb-hint" id="native-hint"><b>WASD</b> move · <b>R-drag</b> look · <b>L-click</b> sets point/builds. <b>Arc:</b> start→end→bulge. <b>Circle:</b> center→radius→thick→height. <b>Esc</b> cancels.</div>
+  </div>
+
+  <!-- Architecture Planner tools -->
+  <div id="planner-tools" style="display:none">
+    <div class="tool-grid">
+      <div class="tool" data-tool="block"><span class="ti">▦</span><span class="tl">Block</span></div>
+      <div class="tool" data-tool="wall"><span class="ti">▭</span><span class="tl">Wall</span></div>
+      <div class="tool" data-tool="circle"><span class="ti">◯</span><span class="tl">Circle</span></div>
+      <div class="tool" data-tool="square"><span class="ti">▢</span><span class="tl">Square</span></div>
+      <div class="tool" data-tool="disc"><span class="ti">⬤</span><span class="tl">Pedestal</span></div>
+      <div class="tool" data-tool="rect"><span class="ti">▤</span><span class="tl">Foundation</span></div>
+      <div class="tool danger" data-tool="remove"><span class="ti">⌫</span><span class="tl">Remove</span></div>
+    </div>
+    <div id="ap-pos" style="margin-top:6px;color:var(--muted);font-size:10px">Ghost: <span id="ap-xyz">—</span></div>
+    <div class="bb-hint" id="planner-hint"><b>WASD</b> move · <b>R-drag</b> look · ghost follows crosshair · <b>1st click</b> anchors · <b>Arrow/IJKL/UO</b> nudge · <b>2nd click</b> builds. <b>Esc</b> cancels.</div>
+  </div>
+
+  <!-- Terraform tools -->
+  <div id="terraform-tools" style="display:none">
+    <div class="tool-grid" style="grid-template-columns:repeat(2,1fr)">
+      <div class="tf-tool active" data-tftool="raise"><span class="ti">▲</span><span class="tl">Raise</span></div>
+      <div class="tf-tool" data-tftool="lower"><span class="ti">▼</span><span class="tl">Lower</span></div>
+      <div class="tf-tool" data-tftool="flatten"><span class="ti">═</span><span class="tl">Flatten</span></div>
+      <div class="tf-tool" data-tftool="erase"><span class="ti">⌫</span><span class="tl">Erase</span></div>
+    </div>
+    <div class="bb-hint" id="terraform-hint"><b>Click/drag</b> to sculpt terrain with a circular brush. Use <b>Radius</b> to adjust brush size.</div>
+  </div>
+
+  <div class="bb-title" style="margin-top:10px">Material</div>
   <div id="swatches" class="swatches"></div>
   <div class="bb-row" id="row-h"><label>Height</label><input id="bd-hh" type="range" min="1" max="48" value="4"><span id="bd-hv">4</span></div>
   <div class="bb-row" id="row-t"><label>Thickness</label><input id="bd-tt" type="range" min="1" max="6" value="1"><span id="bd-tv">1</span></div>
   <div class="bb-row" id="row-r"><label>Radius</label><input id="bd-r" type="range" min="1" max="64" value="8"><span id="bd-rv">8</span></div>
-  <div class="bb-hint">Aim with the <b>cursor</b>. <b>L-click</b> sets a point, click again to build. <b>Arc:</b> start → end → bulge → place. <b>Circle:</b> center → radius → thickness (drag inward) → height → place. <b>Square:</b> corner → opposite corner → thickness (drag inward) → height → place. <b>R-drag</b> to look, <b>WASD/Space/Ctrl</b> to fly, <b>Esc</b> cancels, <b>B</b> exits build.</div>
 </div>
 <div id="bd-badge">BUILD · <b id="bd-tool">WALL</b> · <b id="bd-mat">Stone</b> · target <span id="bd-hover">—</span></div>
 
-<!-- pulsing click-to-lock banner (visible while unlocked + game running) -->
-<div id="focus-banner" class="hud">▶ &nbsp;CLICK TO LOOK &nbsp;·&nbsp; ESC TO RELEASE</div>
-
-<!-- FPS crosshair (visible only while pointer is locked) -->
-<div id="xhair" class="hud">
-  <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <line x1="0"  y1="12" x2="8"  y2="12" stroke="white" stroke-width="1.5" stroke-opacity=".82"/>
-    <line x1="16" y1="12" x2="24" y2="12" stroke="white" stroke-width="1.5" stroke-opacity=".82"/>
-    <line x1="12" y1="0"  x2="12" y2="8"  stroke="white" stroke-width="1.5" stroke-opacity=".82"/>
-    <line x1="12" y1="16" x2="12" y2="24" stroke="white" stroke-width="1.5" stroke-opacity=".82"/>
-    <rect x="11.2" y="11.2" width="1.6" height="1.6" fill="white" fill-opacity=".7"/>
-  </svg>
+<div class="hint" id="hint">
+  <b>Click</b> to capture mouse · <b>WASD</b> move · <b>Space/Ctrl</b> up·down · <b>Shift</b> sprint · <b>B</b> build · <b>G</b> new seed · <b>O/I</b> save/load
 </div>
-
-<div id="overlay">
-  <div class="card">
-    <h1><b>Doon</b>Engine → WebGPU</h1>
-    <p>A faithful port of frozein's per-voxel path-tracing engine.
-       Lighting is computed and cached <i>per voxel</i> (not per pixel), path-traced and
-       accumulated over frames. Rays march a sparse 8³ chunk grid, skipping empty space.</p>
-    <div class="keys">
-      <div>WASD</div><div>move horizontally</div>
-      <div>Space / Ctrl</div><div>fly up / down</div>
-      <div>Mouse</div><div>look (click canvas to lock · Esc to release)</div>
-      <div>1–6</div><div>full / albedo / diffuse / specular / vox-normal / face-normal</div>
-      <div>L</div><div>animate the sun · R resets accumulated light</div>
-      <div>Ctrl+U</div><div>set radar spawn point to current location</div>
-      <div>G</div><div>regenerate the world with a fresh random seed</div>
-      <div>O / I</div><div>save world to JSON · load world from JSON (seed + edits)</div>
-    </div>
-    <div class="seedrow">
-      <label for="seed">SEED</label>
-      <input id="seed" type="text" spellcheck="false" autocomplete="off" placeholder="number or text…" />
-      <button id="reroll" title="Random seed">🎲</button>
-    </div>
-    <p style="font-size:11px;margin:6px 0 0">Dead-flat buildable plains · mountains come from an editable JSON <code>MOUNTAINS</code> list, each mixing walkable ramps with cliff faces (per-entity <code>cliff</code> 0–1).</p>
-    <button id="start">Generate world &amp; launch</button>
-    <div id="err"></div>
-  </div>
-</div>
-
-<div id="loading"><div class="t" id="ltext">Generating microvoxel world…</div>
-  <div class="bar"><i id="lbar"></i></div></div>
 
 <script type="module" src="./main.js"></script>
 </body>
